@@ -18,17 +18,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     $customer_name = trim($_POST['customer_name']);
     $customer_car_type = trim($_POST['customer_car_type']);
 
-
-// --- إرسال إشارة بوجود طلب جديد للمطعم (آلية ملفات بسيطة) ---
-        $notification_dir = __DIR__ . '/../notifications'; // مجلد لتخزين ملفات الإشعارات، خارج public/admin
-        if (!is_dir($notification_dir)) {
-            mkdir($notification_dir, 0775, true); // أنشئ المجلد إذا لم يكن موجودًا
-        }
-        // اسم الملف سيكون بناءً على restaurant_id لتمييز الإشعارات لكل مطعم
-        // يمكن إضافة timestamp أو order_id للملف لجعله فريدًا لكل طلب إذا أردنا تفاصيل أكثر في الإشعار
-        $notification_file_content = json_encode(['order_id' => $new_order_id, 'time' => time()]);
-        file_put_contents($notification_dir . '/restaurant_' . $restaurant_id . '.new_order', $notification_file_content);
-        // ---------------------------------------------------------------
     // التحقق الأساسي من البيانات
     if (!$restaurant_id || $order_total_from_client === false || empty($cart_data_json) || empty($customer_name) || empty($customer_car_type)) {
         header("Location: menu.php?slug=" . urlencode($restaurant_slug_for_redirect) . "&order_status=failed&reason=missing_data");
@@ -43,19 +32,112 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         exit;
     }
 
+    $validated_items = [];
+    $computed_total = 0.0;
+
+    foreach ($cart_items as $item) {
+        $menu_item_id = isset($item['id']) ? intval($item['id']) : 0;
+        $quantity = isset($item['quantity']) ? intval($item['quantity']) : 0;
+        if ($menu_item_id <= 0 || $quantity <= 0) {
+            header("Location: menu.php?slug=" . urlencode($restaurant_slug_for_redirect) . "&order_status=failed&reason=invalid_item");
+            exit;
+        }
+
+        // Fetch base price ensuring the item belongs to the restaurant
+        $stmt = $conn->prepare(
+            "SELECT mi.name, mi.price FROM menu_items mi
+             JOIN menu_categories mc ON mi.menu_category_id = mc.id
+             JOIN menu_sections ms ON mc.menu_section_id = ms.id
+             WHERE mi.id = ? AND ms.restaurant_id = ? LIMIT 1"
+        );
+        if (!$stmt) {
+            error_log('Prepare failed fetching menu item price: ' . $conn->error);
+            header("Location: menu.php?slug=" . urlencode($restaurant_slug_for_redirect) . "&order_status=failed&reason=server_error");
+            exit;
+        }
+        $stmt->bind_param("ii", $menu_item_id, $restaurant_id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        if ($result->num_rows !== 1) {
+            // الصنف غير موجود أو لا يتبع المطعم
+            $stmt->close();
+            header("Location: menu.php?slug=" . urlencode($restaurant_slug_for_redirect) . "&order_status=failed&reason=invalid_item");
+            exit;
+        }
+        $row = $result->fetch_assoc();
+        $base_price = floatval($row['price']);
+        $item_name_from_db = $row['name'];
+        $stmt->close();
+
+        $options_total = 0.0;
+        $validated_options = [];
+        if (!empty($item['selectedOptions']) && is_array($item['selectedOptions'])) {
+            foreach ($item['selectedOptions'] as $opt) {
+                $opt_group = $opt['group'] ?? '';
+                $opt_name = $opt['name'] ?? '';
+                $stmt_opt = $conn->prepare(
+                    "SELECT additional_price FROM menu_item_options
+                     WHERE menu_item_id = ? AND option_group_name = ? AND option_name = ? AND is_available = 1 LIMIT 1"
+                );
+                if (!$stmt_opt) {
+                    error_log('Prepare failed fetching option price: ' . $conn->error);
+                    header("Location: menu.php?slug=" . urlencode($restaurant_slug_for_redirect) . "&order_status=failed&reason=server_error");
+                    exit;
+                }
+                $stmt_opt->bind_param("iss", $menu_item_id, $opt_group, $opt_name);
+                $stmt_opt->execute();
+                $res_opt = $stmt_opt->get_result();
+                if ($res_opt->num_rows !== 1) {
+                    $stmt_opt->close();
+                    header("Location: menu.php?slug=" . urlencode($restaurant_slug_for_redirect) . "&order_status=failed&reason=invalid_option");
+                    exit;
+                }
+                $opt_row = $res_opt->fetch_assoc();
+                $opt_price = floatval($opt_row['additional_price']);
+                $options_total += $opt_price;
+                $validated_options[] = [
+                    'group' => $opt_group,
+                    'name'  => $opt_name,
+                    'price' => $opt_price
+                ];
+                $stmt_opt->close();
+            }
+        }
+
+        $unit_price = $base_price + $options_total;
+        $sub_total = $unit_price * $quantity;
+        $computed_total += $sub_total;
+
+        $validated_items[] = [
+            'menu_item_id' => $menu_item_id,
+            'item_name' => $item_name_from_db,
+            'quantity' => $quantity,
+            'price_per_item' => $unit_price,
+            'selected_options_json' => !empty($validated_options) ? json_encode($validated_options) : null,
+            'sub_total' => $sub_total
+        ];
+    }
+
+    $computed_total = round($computed_total, 2);
+
+    if (abs($computed_total - $order_total_from_client) > 0.01) {
+        header("Location: menu.php?slug=" . urlencode($restaurant_slug_for_redirect) . "&order_status=failed&reason=total_mismatch");
+        exit;
+    }
+
     // --- بدء معاملة قاعدة البيانات (Transaction) ---
     $conn->begin_transaction();
 
     try {
         // 1. إدخال الطلب الرئيسي في جدول 'orders'
         $order_status = 'جديد'; // أو 'Pending'
-        // ملاحظة: $order_total_from_client هو الإجمالي من العميل. يجب التحقق منه من جانب الخادم في تطبيق حقيقي.
+        // تم حساب الإجمالي في الخادم للتأكد من صحة الأسعار والخيارات
         
         $stmt_order = $conn->prepare("INSERT INTO orders (restaurant_id, customer_name, customer_car_type, total_amount, order_status) VALUES (?, ?, ?, ?, ?)");
         if (!$stmt_order) {
             throw new Exception("فشل إعداد استعلام الطلب: " . $conn->error);
         }
-        $stmt_order->bind_param("issds", $restaurant_id, $customer_name, $customer_car_type, $order_total_from_client, $order_status);
+        $stmt_order->bind_param("issds", $restaurant_id, $customer_name, $customer_car_type, $computed_total, $order_status);
         
         if (!$stmt_order->execute()) {
             throw new Exception("فشل في حفظ الطلب الرئيسي: " . $stmt_order->error);
@@ -70,13 +152,13 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             throw new Exception("فشل إعداد استعلام أصناف الطلب: " . $conn->error);
         }
 
-        foreach ($cart_items as $item) {
-            $menu_item_id_original = $item['id']; // معرّف الصنف الأصلي من جدول menu_items
-            $item_name_ordered = $item['name'];
-            $quantity_ordered = $item['quantity'];
-            $price_per_unit_ordered = $item['finalPricePerUnit']; // السعر المحسوب للوحدة شامل الخيارات
-            $selected_options_json = !empty($item['selectedOptions']) ? json_encode($item['selectedOptions']) : null;
-            $sub_total_for_item = $price_per_unit_ordered * $quantity_ordered;
+        foreach ($validated_items as $vItem) {
+            $menu_item_id_original = $vItem['menu_item_id'];
+            $item_name_ordered = $vItem['item_name'];
+            $quantity_ordered = $vItem['quantity'];
+            $price_per_unit_ordered = $vItem['price_per_item'];
+            $selected_options_json = $vItem['selected_options_json'];
+            $sub_total_for_item = $vItem['sub_total'];
 
             $stmt_order_item->bind_param("iisidsd", 
                 $new_order_id, 
@@ -95,7 +177,15 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 
         // --- إذا كل شيء تمام، قم بتأكيد المعاملة (Commit) ---
         $conn->commit();
-        
+
+        // إنشاء ملف إشعار للمطعم بالطلب الجديد
+        $notification_dir = __DIR__ . '/../notifications';
+        if (!is_dir($notification_dir)) {
+            mkdir($notification_dir, 0775, true);
+        }
+        $notification_file_content = json_encode(['order_id' => $new_order_id, 'time' => time()]);
+        file_put_contents($notification_dir . '/restaurant_' . $restaurant_id . '.new_order', $notification_file_content);
+
         $order_id_for_confirmation = $new_order_id;
         $message = "تم استلام طلبك بنجاح! رقم طلبك هو: " . $new_order_id;
         $message_type = "success";
