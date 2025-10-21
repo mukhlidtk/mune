@@ -11,10 +11,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $username = $_POST['username'] ?? '';
     $password = $_POST['password'] ?? '';
 
-    $adminUser = getenv('ADMIN_USER') ?: 'admin';
-    $adminPass = getenv('ADMIN_PASS') ?: 'admin123';
+    $config = include __DIR__ . '/../config/admin.php';
+    $adminUser = $config['username'] ?? null;
+    $adminHash = $config['password_hash'] ?? null;
 
-    if ($username === $adminUser && $password === $adminPass) {
+    if (!$adminUser || !$adminHash) {
+        $error = 'لم يتم ضبط بيانات تسجيل الدخول.';
+    } elseif ($username === $adminUser && password_verify($password, $adminHash)) {
         $_SESSION['admin_logged_in'] = true;
         header('Location: index.php');
         exit();
